@@ -1,0 +1,389 @@
+name: Build macOS (Intel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_preset:
+        description: 'CMake preset to build with'
+        required: true
+        default: 'Distribution'
+        type: choice
+        options:
+          - Distribution
+          - Release
+          - Debug
+          - Sanitizer
+      version:
+        description: 'Optional release version, such as 2026.46.0'
+        required: false
+        default: ''
+        type: string
+      run_tests:
+        description: 'Run the CTest suite after building'
+        required: false
+        default: false
+        type: boolean
+      use_caches:
+        description: 'Use GitHub Actions caches for ccache, sccache, cargo, and vcpkg'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_COMPILERCHECK: '%compiler% -v'
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
+  SCCACHE_CACHE_SIZE: 2G
+  SCCACHE_IDLE_TIMEOUT: 0
+
+jobs:
+  build:
+    name: macOS, x86_64, ${{ inputs.build_preset || 'Distribution' }}, Clang
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set workspace environment
+        shell: bash
+        run: |
+          git config --file "${RUNNER_TEMP}/gitconfig" --add safe.directory "${GITHUB_WORKSPACE}"
+          echo "GIT_CONFIG_GLOBAL=${RUNNER_TEMP}/gitconfig" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/pip-cache"
+          echo "PIP_CACHE_DIR=${RUNNER_TEMP}/pip-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: 3.12
+          cache: ${{ inputs.use_caches && 'pip' || '' }}
+          cache-dependency-path: requirements.txt
+
+      - name: Set up Python environment
+        shell: bash
+        run: |
+          python_bin=$(python3 "${GITHUB_WORKSPACE}/Meta/Utils/python_environment.py" --print-bin | tr -d '\r')
+          echo "${python_bin}" >> "$GITHUB_PATH"
+          echo "pythonLocation=$(dirname "${python_bin}")" >> "$GITHUB_ENV"
+
+      - name: Select Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26'
+
+      - name: Verify toolchain architecture and Xcode
+        shell: bash
+        run: |
+          uname -m
+          sw_vers
+          xcodebuild -version
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          brew update
+          brew unlink openssl@3 || true
+          brew install \
+            autoconf \
+            autoconf-archive \
+            automake \
+            bash \
+            ccache \
+            cmake \
+            coreutils \
+            libtool \
+            make \
+            nasm \
+            ninja \
+            pkg-config \
+            sccache \
+            unzip
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Warm up the Rust toolchain
+        shell: bash
+        run: |
+          if rustup toolchain install && cargo --version && rustc --version ; then
+            exit 0
+          fi
+
+          CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "${GITHUB_WORKSPACE}/rust-toolchain.toml")
+          if [ -z "${CHANNEL}" ]; then
+            echo "Could not determine the pinned Rust channel" >&2
+            exit 1
+          fi
+
+          echo "Reinstalling Rust toolchain ${CHANNEL} from scratch"
+          rustup toolchain uninstall "${CHANNEL}" || rm -rf "$(rustup show home)/toolchains/${CHANNEL}"-*
+          rustup toolchain install
+          cargo --version
+          rustc --version
+
+      - name: Restore wasm-tools
+        id: wasm-tools-cache
+        if: ${{ inputs.use_caches }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/wasm-tools
+          key: wasm-tools-1.243.0-x86_64-macos
+
+      - name: Install wasm-tools
+        if: ${{ steps.wasm-tools-cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          NAME="wasm-tools-1.243.0-x86_64-macos"
+          FILENAME="${NAME}.tar.gz"
+          URL="https://github.com/bytecodealliance/wasm-tools/releases/download/v1.243.0/${FILENAME}"
+
+          delays=(5 15 45)
+          attempt=1
+          until curl --fail --location --output "${FILENAME}" "${URL}"; do
+            if (( attempt > ${#delays[@]} )); then
+              echo "wasm-tools download failed after $(( ${#delays[@]} + 1 )) attempts" >&2
+              exit 1
+            fi
+            echo "wasm-tools download failed; retrying in ${delays[attempt-1]}s" >&2
+            sleep "${delays[attempt-1]}"
+            attempt=$(( attempt + 1 ))
+          done
+
+          tar -xzf "${FILENAME}"
+          rm "${FILENAME}"
+          mv "${NAME}" wasm-tools
+
+      - name: Save wasm-tools
+        if: ${{ inputs.use_caches && steps.wasm-tools-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/wasm-tools
+          key: ${{ steps.wasm-tools-cache.outputs.cache-primary-key }}
+
+      - name: Add wasm-tools to PATH
+        shell: bash
+        run: echo "${GITHUB_WORKSPACE}/wasm-tools" >> "$GITHUB_PATH"
+
+      - name: Restore cargo registry
+        id: cargo-registry
+        if: ${{ inputs.use_caches }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-x86_64-${{ hashFiles('Cargo.lock', 'Libraries/LibJS/Flap/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-x86_64-
+
+      - name: Fetch cargo dependencies
+        shell: bash
+        run: |
+          for manifest in Cargo.toml Libraries/LibJS/Flap/Cargo.toml; do
+            if [ -f "${manifest}" ]; then
+              cargo fetch --locked --manifest-path "${manifest}"
+            fi
+          done
+
+      - name: Save cargo registry
+        if: ${{ inputs.use_caches && steps.cargo-registry.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cargo/registry
+          key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
+
+      - name: Install vcpkg
+        shell: bash
+        run: ./Meta/ladybird.py vcpkg --preset "${{ inputs.build_preset }}"
+
+      - name: Date stamp for caches
+        id: date-stamp
+        if: ${{ inputs.use_caches }}
+        shell: bash
+        run: echo "timestamp=$(date -u "+%Y%m%d%H%M_%S")" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        id: ccache
+        if: ${{ inputs.use_caches }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache | macOS | x86_64 | Clang | ${{ inputs.build_preset }} | ${{ steps.date-stamp.outputs.timestamp }}
+          restore-keys: |
+            ccache | macOS | x86_64 | Clang | ${{ inputs.build_preset }}
+
+      - name: Configure ccache
+        if: ${{ inputs.use_caches }}
+        shell: bash
+        run: |
+          ccache -M 0
+          if [ -d "${CCACHE_DIR}" ]; then
+            find "${CCACHE_DIR}" -depth -exec gtouch -a -m -d "2018-10-10T09:53:07Z" {} +
+          fi
+          ccache -s
+          ccache -z
+
+      - name: Restore sccache
+        id: sccache
+        if: ${{ inputs.use_caches }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache | macOS | x86_64 | Clang | ${{ inputs.build_preset }} | ${{ steps.date-stamp.outputs.timestamp }}
+          restore-keys: |
+            sccache | macOS | x86_64 | Clang | ${{ inputs.build_preset }}
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        if: ${{ inputs.use_caches }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/Build/caches/vcpkg-binary-cache
+          key: vcpkg | macOS | x86_64 | Clang | ${{ inputs.build_preset }} | ${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg | macOS | x86_64 | Clang | ${{ inputs.build_preset }}
+
+      - name: Restore WebAssembly spec test suite
+        id: wasm-spec-tests-cache
+        if: ${{ inputs.use_caches }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/Build/caches/WasmSpecTests
+          key: wasm-spec-test-suite | ${{ hashFiles('Meta/CMake/wasm_spec_tests.cmake') }}
+
+      - name: Configure
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          HOST_CC=$(xcrun --find clang)
+          HOST_CXX=$(xcrun --find clang++)
+          echo "CC=${HOST_CC}" >> "$GITHUB_ENV"
+          echo "CXX=${HOST_CXX}" >> "$GITHUB_ENV"
+
+          cmake --preset "${{ inputs.build_preset }}" -B Build \
+            -DLADYBIRD_BASELINE_CPU_TARGET=ON \
+            -DINCLUDE_WASM_SPEC_TESTS=ON \
+            -DWASM_SPEC_TEST_SKIP_FORMATTING=ON \
+            -DPython3_EXECUTABLE="${{ env.pythonLocation }}/bin/python" \
+            -DCMAKE_C_COMPILER="${HOST_CC}" \
+            -DCMAKE_CXX_COMPILER="${HOST_CXX}" \
+            "-DLADYBIRD_VERSION=${RELEASE_VERSION}"
+
+          # Reclaim runner disk space after vcpkg finishes building dependencies.
+          rm -rf Build/vcpkg-*/buildtrees Build/vcpkg-*/downloads
+
+      - name: Build
+        working-directory: ${{ github.workspace }}/Build
+        shell: bash
+        run: cmake --build .
+
+      - name: Install
+        working-directory: ${{ github.workspace }}/Build
+        shell: bash
+        run: cmake --install . --strip --prefix "${{ github.workspace }}/Install"
+
+      - name: Save WebAssembly spec test suite
+        if: ${{ inputs.use_caches && steps.wasm-spec-tests-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/Build/caches/WasmSpecTests
+          key: ${{ steps.wasm-spec-tests-cache.outputs.cache-primary-key }}
+
+      - name: Prune and save caches
+        if: ${{ inputs.use_caches }}
+        shell: bash
+        run: |
+          ccache --evict-older-than=1d
+          ccache -s
+          sccache --stop-server || true
+
+      - name: Save ccache
+        if: ${{ inputs.use_caches }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Save sccache
+        if: ${{ inputs.use_caches }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.sccache.outputs.cache-primary-key }}
+
+      - name: Save vcpkg binary cache
+        if: ${{ inputs.use_caches && steps.vcpkg-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/Build/caches/vcpkg-binary-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Package Distribution archives
+        if: ${{ inputs.build_preset == 'Distribution' }}
+        working-directory: ${{ github.workspace }}/Build
+        shell: bash
+        run: |
+          cpack -G TXZ -B packages -D CPACK_COMPONENTS_ALL="ladybird_Runtime;ladybird_Symbols" \
+            -D CPACK_ARCHIVE_COMPRESSION_LEVEL=9 -D CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY=ON
+
+      - name: Upload Ladybird (Distribution)
+        if: ${{ inputs.build_preset == 'Distribution' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-macOS-x86_64-Distribution
+          path: |
+            Build/packages/ladybird-*.tar.xz
+            !Build/packages/ladybird-symbols-*.tar.xz
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload debug symbols (Distribution)
+        if: ${{ inputs.build_preset == 'Distribution' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-symbols-macOS-x86_64-Distribution
+          path: Build/packages/ladybird-symbols-*.tar.xz
+          archive: false
+          if-no-files-found: error
+
+      - name: Package self-contained macOS app bundle
+        if: ${{ inputs.build_preset != 'Distribution' }}
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          "${{ env.pythonLocation }}/bin/python" Meta/package-macos-test-bundle.py \
+            --build-dir Build \
+            --install-dir Install \
+            --output "ladybird-app-bundle-macOS-x86_64-${{ inputs.build_preset }}.tar.gz"
+
+      - name: Upload Ladybird app bundle
+        if: ${{ inputs.build_preset != 'Distribution' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-app-bundle-macOS-x86_64-${{ inputs.build_preset }}
+          path: ladybird-app-bundle-macOS-x86_64-${{ inputs.build_preset }}.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Test
+        if: ${{ inputs.run_tests }}
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          if [ "${{ inputs.build_preset }}" = "Sanitizer" ]; then
+            export ASAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/asan.log\""
+            export UBSAN_OPTIONS="log_path=\"${GITHUB_WORKSPACE}/Build/ubsan.log\""
+            ctest --preset Sanitizer --parallel --output-on-failure -E 'LibWebAccessibilityBridge|AccessibilityBridgeMac' --test-dir Build --timeout 1800
+          else
+            ctest --parallel --output-on-failure -E 'LibWebAccessibilityBridge|AccessibilityBridgeMac' --test-dir Build --timeout 1800
+          fi
