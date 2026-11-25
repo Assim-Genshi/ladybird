@@ -90,24 +90,84 @@ jobs:
 
       - name: Install build dependencies
         shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
-          brew update
-          brew unlink openssl@3 || true
-          brew install \
-            autoconf \
-            autoconf-archive \
-            automake \
-            bash \
-            ccache \
-            cmake \
-            coreutils \
-            libtool \
-            make \
-            nasm \
-            ninja \
-            pkg-config \
-            sccache \
-            unzip
+          packages=()
+          check_tool() {
+            local cmd="$1"
+            local formula="${2:-$1}"
+            if ! command -v "${cmd}" >/dev/null 2>&1; then
+              packages+=("${formula}")
+            fi
+          }
+
+          check_tool autoconf
+          if ! brew list --formula autoconf-archive >/dev/null 2>&1; then
+            packages+=(autoconf-archive)
+          fi
+          check_tool automake
+          check_tool bash
+          check_tool ccache
+          check_tool cmake
+          check_tool glibtoolize libtool
+          check_tool gmake make
+          check_tool nasm
+          check_tool ninja
+          check_tool pkg-config
+          check_tool unzip
+
+          if (( ${#packages[@]} > 0 )); then
+            echo "Installing missing packages: ${packages[*]}"
+            brew install "${packages[@]}"
+          else
+            echo "All required Homebrew build tools are already installed."
+          fi
+
+      - name: Restore sccache binary
+        id: sccache-bin-cache
+        if: ${{ inputs.use_caches }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/sccache
+          key: sccache-v0.19.0-x86_64-apple-darwin
+
+      - name: Install sccache
+        if: ${{ steps.sccache-bin-cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          NAME="sccache-v0.19.0-x86_64-apple-darwin"
+          FILENAME="${NAME}.tar.gz"
+          URL="https://github.com/mozilla/sccache/releases/download/v0.19.0/${FILENAME}"
+
+          delays=(5 15 45)
+          attempt=1
+          until curl --fail --location --output "${FILENAME}" "${URL}"; do
+            if (( attempt > ${#delays[@]} )); then
+              echo "sccache download failed after $(( ${#delays[@]} + 1 )) attempts" >&2
+              exit 1
+            fi
+            echo "sccache download failed; retrying in ${delays[attempt-1]}s" >&2
+            sleep "${delays[attempt-1]}"
+            attempt=$(( attempt + 1 ))
+          done
+
+          tar -xzf "${FILENAME}"
+          rm "${FILENAME}"
+          mv "${NAME}" sccache
+
+      - name: Save sccache binary
+        if: ${{ inputs.use_caches && steps.sccache-bin-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/sccache
+          key: ${{ steps.sccache-bin-cache.outputs.cache-primary-key }}
+
+      - name: Add sccache to PATH
+        shell: bash
+        run: |
+          echo "${GITHUB_WORKSPACE}/sccache" >> "$GITHUB_PATH"
+          "${GITHUB_WORKSPACE}/sccache/sccache" --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -226,7 +286,15 @@ jobs:
         run: |
           ccache -M 0
           if [ -d "${CCACHE_DIR}" ]; then
-            find "${CCACHE_DIR}" -depth -exec gtouch -a -m -d "2018-10-10T09:53:07Z" {} +
+            python3 - <<'PY'
+          import os
+          ts = 1539165187  # 2018-10-10T09:53:07Z
+          for root, dirs, files in os.walk(os.environ["CCACHE_DIR"], topdown=False):
+              for name in files + dirs:
+                  path = os.path.join(root, name)
+                  if not os.path.islink(path):
+                      os.utime(path, (ts, ts))
+          PY
           fi
           ccache -s
           ccache -z
